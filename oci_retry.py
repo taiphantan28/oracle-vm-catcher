@@ -16,10 +16,13 @@ import datetime
 # CẤU HÌNH
 # ══════════════════════════════════════════════════════════════
 
-# Tenancy OCID (compartment root = tenancy)
+# Tenancy OCID (đọc từ env var)
 COMPARTMENT_ID = os.environ.get("OCI_TENANCY")
 
-# SSH public key của bạn (paste nội dung file .pub vào đây)
+# Subnet OCID (đọc từ env var - BẮT BUỘC)
+SUBNET_ID = os.environ.get("OCI_SUBNET_ID")
+
+# SSH public key của bạn
 SSH_PUBLIC_KEY = """ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCZ9ejGngFmxxUWMbDhGsJV39jPl8MmIoAZ8OWU9oNXdnRL+RrRAp49z2RrKUJEwCnl3evEeuNlFL8oFGq3PCJwsgeOscAvGc+Qo1tWnEarwDtO9YrvdyUvFw8DC/7FB8v62nY/WlOVyFsebeEy+v3LLG3BOuYrGpxtBkS4xmbQV5h7MHDyO08iEVwhnlF0M5wM2cC9UVNVOh30KzjpPECYMOO9KEzd1VYY7/1qc1gDO5dtUXmTJ7NjJSQQY0smQgV49Wu+AMTJx6msjEMYOTtqpCUzJyRUmZ3sQrAWuUjULbvTjU9knEXaHIvL3HkBH5OVboWwLNgFIQKUOkDhjbOL ssh-key-2026-09-19"""
 
 # Tên instance
@@ -34,11 +37,6 @@ BOOT_VOLUME_GB = 100
 # Retry interval (giây)
 RETRY_INTERVAL = 60
 
-# OS Image: Ubuntu 22.04 (Canonical)
-# Nếu Oracle đổi image ID, script sẽ tự list và chọn
-OS_NAME = "Canonical Ubuntu"
-OS_VERSION = "22.04"
-
 # ══════════════════════════════════════════════════════════════
 # HÀM HỖ TRỢ
 # ══════════════════════════════════════════════════════════════
@@ -50,7 +48,7 @@ def get_availability_domain(identity_client, compartment_id):
 
 
 def get_ubuntu_image(compute_client, compartment_id):
-    """Tìm image Ubuntu 22.04 mới nhất."""
+    """Tìm image Ubuntu mới nhất tương thích ARM."""
     images = compute_client.list_images(
         compartment_id,
         operating_system="Canonical Ubuntu",
@@ -63,7 +61,6 @@ def get_ubuntu_image(compute_client, compartment_id):
         if "22.04" in img.display_name:
             return img.id
     
-    # Fallback: lấy image đầu tiên
     if images:
         return images[0].id
     
@@ -102,7 +99,7 @@ def try_create_instance(compute_client, compartment_id, ad, image_id):
             ),
             create_vnic_details=oci.core.models.CreateVnicDetails(
                 assign_public_ip=True,
-                subnet_id=None,  # Oracle sẽ auto
+                subnet_id=SUBNET_ID,
             ),
             metadata={
                 "ssh_authorized_keys": SSH_PUBLIC_KEY,
@@ -135,12 +132,14 @@ def main():
     print(f"Shape: {SHAPE} ({OCPUS} OCPU / {MEMORY_GB} GB RAM)")
     print("=" * 60)
     
-    # Kiểm tra config
     if not COMPARTMENT_ID:
         print("❌ Thiếu OCI_TENANCY trong environment.")
         sys.exit(1)
     
-    # Khởi tạo OCI clients từ env vars (GitHub Actions auto-tạo config)
+    if not SUBNET_ID:
+        print("❌ Thiếu OCI_SUBNET_ID trong environment.")
+        sys.exit(1)
+    
     try:
         config = oci.config.from_file()
     except Exception as e:
@@ -150,12 +149,10 @@ def main():
     identity_client = oci.identity.IdentityClient(config)
     compute_client = oci.core.ComputeClient(config)
     
-    # Kiểm tra instance đã tồn tại chưa
     if check_instance_exists(compute_client, COMPARTMENT_ID):
         print(f"✅ Instance '{INSTANCE_NAME}' đã tồn tại. Không cần tạo thêm.")
         sys.exit(0)
     
-    # Lấy AD và Image
     ad = get_availability_domain(identity_client, COMPARTMENT_ID)
     print(f"📍 Availability Domain: {ad}")
     
@@ -163,7 +160,6 @@ def main():
     print(f"🖼️  Image: {image_id}")
     print()
     
-    # Retry loop (chỉ chạy tối đa 5 lần trong 1 workflow để không tốn thời gian)
     max_attempts = 5
     for i in range(max_attempts):
         print(f"🔄 Lần thử {i+1}/{max_attempts}...")
@@ -174,7 +170,7 @@ def main():
         if i < max_attempts - 1:
             time.sleep(RETRY_INTERVAL)
     
-    print("⏳ Hết lượt thử trong workflow này. GitHub Actions sẽ tự chạy lại sau 10 phút.")
+    print("⏳ Hết lượt thử trong workflow này. GitHub Actions sẽ tự chạy lại sau 5 phút.")
     sys.exit(0)
 
 

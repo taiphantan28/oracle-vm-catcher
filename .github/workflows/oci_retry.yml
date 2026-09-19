@@ -2,7 +2,7 @@ name: OCI ARM Retry
 
 on:
   schedule:
-    - cron: '*/10 * * * *'
+    - cron: '*/5 * * * *'
   workflow_dispatch:
 
 jobs:
@@ -42,4 +42,5 @@ jobs:
       - name: Run retry script
         env:
           OCI_TENANCY: ${{ secrets.OCI_TENANCY }}
+          OCI_SUBNET_ID: ${{ secrets.OCI_SUBNET_ID }}
         run: python oci_retry.py
