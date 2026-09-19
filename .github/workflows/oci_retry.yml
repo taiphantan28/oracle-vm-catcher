@@ -1,0 +1,45 @@
+name: OCI ARM Retry
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+jobs:
+  retry-create-instance:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install OCI SDK
+        run: |
+          python -m pip install --upgrade pip
+          pip install oci
+      
+      - name: Create OCI config file
+        run: |
+          mkdir -p ~/.oci
+          cat > ~/.oci/config << EOF
+          [DEFAULT]
+          user=${{ secrets.OCI_USER }}
+          fingerprint=${{ secrets.OCI_FINGERPRINT }}
+          tenancy=${{ secrets.OCI_TENANCY }}
+          region=${{ secrets.OCI_REGION }}
+          key_file=~/.oci/oci_api_key.pem
+          EOF
+          
+          echo "${{ secrets.OCI_PRIVATE_KEY }}" > ~/.oci/oci_api_key.pem
+          chmod 600 ~/.oci/oci_api_key.pem
+          chmod 600 ~/.oci/config
+      
+      - name: Run retry script
+        env:
+          OCI_TENANCY: ${{ secrets.OCI_TENANCY }}
+        run: python oci_retry.py

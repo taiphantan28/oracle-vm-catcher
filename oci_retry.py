@@ -1,206 +1,181 @@
+"""
+OCI ARM Retry Script
+Tự động retry tạo instance VM.Standard.A1.Flex (2 OCPU / 12 GB RAM)
+cho đến khi thành công hoặc phát hiện instance đã tồn tại.
+
+Author: taiphantan28
+"""
+
 import oci
+import os
 import time
+import sys
 import datetime
 
-# ╔══════════════════════════════════════════════════════╗
-# ║  Target : VM.Standard.A1.Flex (ARM)                  ║
-# ║  Spec   : 2 OCPU / 12 GB RAM / 100 GB disk (default) ║
-# ║  Arch   : ARM (Ampere)                               ║
-# ║  Tier   : Oracle Always Free                         ║
-# ║  OS     : Canonical Ubuntu 22.04                     ║
-# ╚══════════════════════════════════════════════════════╝
+# ══════════════════════════════════════════════════════════════
+# CẤU HÌNH
+# ══════════════════════════════════════════════════════════════
 
-# ─── Configuration ───────────────────────────────────────
-COMPARTMENT_ID = (
-    "ocid1.tenancy.oc1..aaaaaaaae3oasib2hvk4lvav3ftr7vxdhifhmmevhwaustbnk3gstq5weonq"  # Replace with your tenancy OCID
-)
-SSH_PUBLIC_KEY = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCZ9ejGngFmxxUWMbDhGsJV39jPl8MmIoAZ8OWU9oNXdnRL+RrRAp49z2RrKUJEwCnl3evEeuNlFL8oFGq3PCJwsgeOscAvGc+Qo1tWnEarwDtO9YrvdyUvFw8DC/7FB8v62nY/WlOVyFsebeEy+v3LLG3BOuYrGpxtBkS4xmbQV5h7MHDyO08iEVwhnlF0M5wM2cC9UVNVOh30KzjpPECYMOO9KEzd1VYY7/1qc1gDO5dtUXmTJ7NjJSQQY0smQgV49Wu+AMTJx6msjEMYOTtqpCUzJyRUmZ3sQrAWuUjULbvTjU9knEXaHIvL3HkBH5OVboWwLNgFIQKUOkDhjbOL ssh-key-2026-09-19"  # Replace with your SSH public key (.pub file content)
+# Tenancy OCID (compartment root = tenancy)
+COMPARTMENT_ID = os.environ.get("OCI_TENANCY")
+
+# SSH public key của bạn (paste nội dung file .pub vào đây)
+SSH_PUBLIC_KEY = """ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCZ9ejGngFmxxUWMbDhGsJV39jPl8MmIoAZ8OWU9oNXdnRL+RrRAp49z2RrKUJEwCnl3evEeuNlFL8oFGq3PCJwsgeOscAvGc+Qo1tWnEarwDtO9YrvdyUvFw8DC/7FB8v62nY/WlOVyFsebeEy+v3LLG3BOuYrGpxtBkS4xmbQV5h7MHDyO08iEVwhnlF0M5wM2cC9UVNVOh30KzjpPECYMOO9KEzd1VYY7/1qc1gDO5dtUXmTJ7NjJSQQY0smQgV49Wu+AMTJx6msjEMYOTtqpCUzJyRUmZ3sQrAWuUjULbvTjU9knEXaHIvL3HkBH5OVboWwLNgFIQKUOkDhjbOL ssh-key-2026-09-19"""
+
+# Tên instance
 INSTANCE_NAME = "n8n-server"
-ARM_OCPUS = 2
-ARM_MEMORY_IN_GBS = 12
-BOOT_VOLUME_SIZE_IN_GBS = 100
-RETRY_INTERVAL = 90  # seconds
-# ────────────────────────────────────────────────────────
 
-# ─── OCI Authentication ──────────────────────────────────
-# [Local] Create a config file at ~/.oci/config
-#   See README.md for format; key_file should point to your API private key .pem
-#
-# [GitHub Actions] No config file needed
-#   The workflow auto-creates it from GitHub Secrets — see README.md
-# ────────────────────────────────────────────────────────
-config = oci.config.from_file()
+# Cấu hình shape
+SHAPE = "VM.Standard.A1.Flex"
+OCPUS = 2
+MEMORY_GB = 12
+BOOT_VOLUME_GB = 100
 
+# Retry interval (giây)
+RETRY_INTERVAL = 60
 
-def get_availability_domain():
-    identity = oci.identity.IdentityClient(config)
-    ads = identity.list_availability_domains(COMPARTMENT_ID).data
+# OS Image: Ubuntu 22.04 (Canonical)
+# Nếu Oracle đổi image ID, script sẽ tự list và chọn
+OS_NAME = "Canonical Ubuntu"
+OS_VERSION = "22.04"
+
+# ══════════════════════════════════════════════════════════════
+# HÀM HỖ TRỢ
+# ══════════════════════════════════════════════════════════════
+
+def get_availability_domain(identity_client, compartment_id):
+    """Lấy Availability Domain đầu tiên."""
+    ads = identity_client.list_availability_domains(compartment_id).data
     return ads[0].name
 
 
-def get_ubuntu_arm_image():
-    compute = oci.core.ComputeClient(config)
-    images = compute.list_images(
-        COMPARTMENT_ID,
+def get_ubuntu_image(compute_client, compartment_id):
+    """Tìm image Ubuntu 22.04 mới nhất."""
+    images = compute_client.list_images(
+        compartment_id,
         operating_system="Canonical Ubuntu",
-        operating_system_version="22.04",
-        shape="VM.Standard.A1.Flex",
+        shape=SHAPE,
         sort_by="TIMECREATED",
         sort_order="DESC",
     ).data
-    if not images:
-        raise Exception("Ubuntu 22.04 ARM image not found")
-    return images[0].id
+    
+    for img in images:
+        if "22.04" in img.display_name:
+            return img.id
+    
+    # Fallback: lấy image đầu tiên
+    if images:
+        return images[0].id
+    
+    raise Exception("Không tìm thấy Ubuntu image")
 
 
-def create_vcn_and_subnet():
-    network = oci.core.VirtualNetworkClient(config)
-
-    # Check if VCN already exists
-    vcns = network.list_vcns(COMPARTMENT_ID, display_name="retry-vcn").data
-    if vcns:
-        vcn = vcns[0]
-        print(f"Using existing VCN: {vcn.id}")
-    else:
-        vcn = network.create_vcn(
-            oci.core.models.CreateVcnDetails(
-                compartment_id=COMPARTMENT_ID,
-                display_name="retry-vcn",
-                cidr_block="10.0.0.0/16",
-            )
-        ).data
-        print(f"Created VCN: {vcn.id}")
-
-        # Create Internet Gateway
-        ig = network.create_internet_gateway(
-            oci.core.models.CreateInternetGatewayDetails(
-                compartment_id=COMPARTMENT_ID,
-                vcn_id=vcn.id,
-                display_name="retry-ig",
-                is_enabled=True,
-            )
-        ).data
-
-        # Update route table to allow outbound traffic
-        network.update_route_table(
-            vcn.default_route_table_id,
-            oci.core.models.UpdateRouteTableDetails(
-                route_rules=[
-                    oci.core.models.RouteRule(
-                        destination="0.0.0.0/0",
-                        network_entity_id=ig.id,
-                    )
-                ]
-            ),
-        )
-
-        # Open inbound ports: SSH / HTTP / HTTPS / Streamlit
-        security_lists = network.list_security_lists(COMPARTMENT_ID, vcn_id=vcn.id).data
-        if security_lists:
-            existing_egress = security_lists[0].egress_security_rules
-            new_ingress = []
-            for port in [22, 80, 443, 8501]:
-                new_ingress.append(
-                    oci.core.models.IngressSecurityRule(
-                        protocol="6",
-                        source="0.0.0.0/0",
-                        tcp_options=oci.core.models.TcpOptions(
-                            destination_port_range=oci.core.models.PortRange(
-                                min=port, max=port
-                            )
-                        ),
-                    )
-                )
-            network.update_security_list(
-                security_lists[0].id,
-                oci.core.models.UpdateSecurityListDetails(
-                    ingress_security_rules=new_ingress,
-                    egress_security_rules=existing_egress,
-                ),
-            )
-
-    # Check if subnet already exists
-    subnets = network.list_subnets(
-        COMPARTMENT_ID, vcn_id=vcn.id, display_name="retry-subnet"
+def check_instance_exists(compute_client, compartment_id):
+    """Kiểm tra instance đã tồn tại chưa."""
+    instances = compute_client.list_instances(
+        compartment_id,
+        display_name=INSTANCE_NAME,
     ).data
-    if subnets:
-        subnet = subnets[0]
-        print(f"Using existing subnet: {subnet.id}")
-    else:
-        subnet = network.create_subnet(
-            oci.core.models.CreateSubnetDetails(
-                compartment_id=COMPARTMENT_ID,
-                vcn_id=vcn.id,
-                display_name="retry-subnet",
-                cidr_block="10.0.0.0/24",
-                prohibit_public_ip_on_vnic=False,
-            )
-        ).data
-        print(f"Created subnet: {subnet.id}")
-
-    return subnet.id
+    
+    for inst in instances:
+        if inst.lifecycle_state not in ["TERMINATED", "TERMINATING"]:
+            return True
+    return False
 
 
-def try_create_instance(subnet_id, ad_name, image_id):
-    compute = oci.core.ComputeClient(config)
-    instance = compute.launch_instance(
-        oci.core.models.LaunchInstanceDetails(
-            compartment_id=COMPARTMENT_ID,
+def try_create_instance(compute_client, compartment_id, ad, image_id):
+    """Thử tạo 1 instance. Trả về True nếu thành công."""
+    try:
+        details = oci.core.models.LaunchInstanceDetails(
+            compartment_id=compartment_id,
+            availability_domain=ad,
             display_name=INSTANCE_NAME,
-            availability_domain=ad_name,
-            shape="VM.Standard.A1.Flex",
+            shape=SHAPE,
             shape_config=oci.core.models.LaunchInstanceShapeConfigDetails(
-                ocpus=ARM_OCPUS,
-                memory_in_gbs=ARM_MEMORY_IN_GBS,
+                ocpus=OCPUS,
+                memory_in_gbs=MEMORY_GB,
             ),
             source_details=oci.core.models.InstanceSourceViaImageDetails(
+                source_type="image",
                 image_id=image_id,
-                boot_volume_size_in_gbs=BOOT_VOLUME_SIZE_IN_GBS,
+                boot_volume_size_in_gbs=BOOT_VOLUME_GB,
             ),
             create_vnic_details=oci.core.models.CreateVnicDetails(
-                subnet_id=subnet_id,
                 assign_public_ip=True,
+                subnet_id=None,  # Oracle sẽ auto
             ),
-            metadata={"ssh_authorized_keys": SSH_PUBLIC_KEY},
+            metadata={
+                "ssh_authorized_keys": SSH_PUBLIC_KEY,
+            },
         )
-    ).data
-    return instance
+        
+        response = compute_client.launch_instance(details)
+        print(f"✅ TẠO THÀNH CÔNG! Instance OCID: {response.data.id}")
+        return True
+    
+    except oci.exceptions.ServiceError as e:
+        if "Out of host capacity" in str(e.message) or e.status == 500:
+            print(f"⏳ [{datetime.datetime.now().strftime('%H:%M:%S')}] Out of capacity. Retry sau {RETRY_INTERVAL}s...")
+        else:
+            print(f"❌ Lỗi: {e.status} - {e.message}")
+        return False
+    except Exception as e:
+        print(f"❌ Lỗi không xác định: {e}")
+        return False
 
+
+# ══════════════════════════════════════════════════════════════
+# MAIN
+# ══════════════════════════════════════════════════════════════
 
 def main():
-    print("Initializing network configuration...")
-    subnet_id = create_vcn_and_subnet()
-
-    print("Fetching availability domain...")
-    ad_name = get_availability_domain()
-    print(f"AD: {ad_name}")
-
-    print("Fetching Ubuntu 22.04 ARM image...")
-    image_id = get_ubuntu_arm_image()
-    print(f"Image ID: {image_id}")
-
-    attempt = 0
-    while True:
-        attempt += 1
-        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        print(f"\n[{now}] Attempt #{attempt} to create instance...")
-
-        try:
-            instance = try_create_instance(subnet_id, ad_name, image_id)
-            print(f"\n✅ Success! Instance created")
-            print(f"   ID: {instance.id}")
-            print(f"   State: {instance.lifecycle_state}")
-            print(f"   Check Oracle Cloud Console for the public IP")
-            break
-        except oci.exceptions.ServiceError as e:
-            if "Out of host capacity" in str(e) or "capacity" in str(e).lower():
-                print(f"❌ Out of capacity, retrying...")
-            else:
-                print(f"❌ API error: {e.message}, retrying...")
-        except Exception as e:
-            print(f"⚠️ Network timeout or other error, retrying... ({type(e).__name__})")
-
-        time.sleep(RETRY_INTERVAL)
+    print("=" * 60)
+    print("OCI ARM Retry Script — Bắt đầu")
+    print(f"Instance name: {INSTANCE_NAME}")
+    print(f"Shape: {SHAPE} ({OCPUS} OCPU / {MEMORY_GB} GB RAM)")
+    print("=" * 60)
+    
+    # Kiểm tra config
+    if not COMPARTMENT_ID:
+        print("❌ Thiếu OCI_TENANCY trong environment.")
+        sys.exit(1)
+    
+    # Khởi tạo OCI clients từ env vars (GitHub Actions auto-tạo config)
+    try:
+        config = oci.config.from_file()
+    except Exception as e:
+        print(f"❌ Không đọc được OCI config: {e}")
+        sys.exit(1)
+    
+    identity_client = oci.identity.IdentityClient(config)
+    compute_client = oci.core.ComputeClient(config)
+    
+    # Kiểm tra instance đã tồn tại chưa
+    if check_instance_exists(compute_client, COMPARTMENT_ID):
+        print(f"✅ Instance '{INSTANCE_NAME}' đã tồn tại. Không cần tạo thêm.")
+        sys.exit(0)
+    
+    # Lấy AD và Image
+    ad = get_availability_domain(identity_client, COMPARTMENT_ID)
+    print(f"📍 Availability Domain: {ad}")
+    
+    image_id = get_ubuntu_image(compute_client, COMPARTMENT_ID)
+    print(f"🖼️  Image: {image_id}")
+    print()
+    
+    # Retry loop (chỉ chạy tối đa 5 lần trong 1 workflow để không tốn thời gian)
+    max_attempts = 5
+    for i in range(max_attempts):
+        print(f"🔄 Lần thử {i+1}/{max_attempts}...")
+        success = try_create_instance(compute_client, COMPARTMENT_ID, ad, image_id)
+        if success:
+            sys.exit(0)
+        
+        if i < max_attempts - 1:
+            time.sleep(RETRY_INTERVAL)
+    
+    print("⏳ Hết lượt thử trong workflow này. GitHub Actions sẽ tự chạy lại sau 10 phút.")
+    sys.exit(0)
 
 
 if __name__ == "__main__":
