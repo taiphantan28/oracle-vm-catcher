@@ -1,7 +1,7 @@
 """
-OCI ARM Retry Script
+OCI ARM Retry Script v2 — Multi-AD + Rate-limit aware
 Tự động retry tạo instance VM.Standard.A1.Flex (2 OCPU / 12 GB RAM)
-cho đến khi thành công hoặc phát hiện instance đã tồn tại.
+qua cả 3 Availability Domains để tăng cơ hội thành công.
 
 Author: taiphantan28
 """
@@ -16,35 +16,29 @@ import datetime
 # CẤU HÌNH
 # ══════════════════════════════════════════════════════════════
 
-# Tenancy OCID (đọc từ env var)
 COMPARTMENT_ID = os.environ.get("OCI_TENANCY")
-
-# Subnet OCID (đọc từ env var - BẮT BUỘC)
 SUBNET_ID = os.environ.get("OCI_SUBNET_ID")
 
-# SSH public key của bạn
 SSH_PUBLIC_KEY = """ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCZ9ejGngFmxxUWMbDhGsJV39jPl8MmIoAZ8OWU9oNXdnRL+RrRAp49z2RrKUJEwCnl3evEeuNlFL8oFGq3PCJwsgeOscAvGc+Qo1tWnEarwDtO9YrvdyUvFw8DC/7FB8v62nY/WlOVyFsebeEy+v3LLG3BOuYrGpxtBkS4xmbQV5h7MHDyO08iEVwhnlF0M5wM2cC9UVNVOh30KzjpPECYMOO9KEzd1VYY7/1qc1gDO5dtUXmTJ7NjJSQQY0smQgV49Wu+AMTJx6msjEMYOTtqpCUzJyRUmZ3sQrAWuUjULbvTjU9knEXaHIvL3HkBH5OVboWwLNgFIQKUOkDhjbOL ssh-key-2026-09-19"""
 
-# Tên instance
 INSTANCE_NAME = "n8n-server"
-
-# Cấu hình shape
 SHAPE = "VM.Standard.A1.Flex"
 OCPUS = 2
 MEMORY_GB = 12
 BOOT_VOLUME_GB = 100
 
-# Retry interval (giây)
-RETRY_INTERVAL = 60
+RETRY_INTERVAL = 120
+MAX_ATTEMPTS_PER_AD = 1
+
 
 # ══════════════════════════════════════════════════════════════
 # HÀM HỖ TRỢ
 # ══════════════════════════════════════════════════════════════
 
-def get_availability_domain(identity_client, compartment_id):
-    """Lấy Availability Domain đầu tiên."""
+def get_all_availability_domains(identity_client, compartment_id):
+    """Lấy TẤT CẢ Availability Domains."""
     ads = identity_client.list_availability_domains(compartment_id).data
-    return ads[0].name
+    return [ad.name for ad in ads]
 
 
 def get_ubuntu_image(compute_client, compartment_id):
@@ -81,7 +75,7 @@ def check_instance_exists(compute_client, compartment_id):
 
 
 def try_create_instance(compute_client, compartment_id, ad, image_id):
-    """Thử tạo 1 instance. Trả về True nếu thành công."""
+    """Thử tạo 1 instance ở 1 AD cụ thể."""
     try:
         details = oci.core.models.LaunchInstanceDetails(
             compartment_id=compartment_id,
@@ -108,17 +102,27 @@ def try_create_instance(compute_client, compartment_id, ad, image_id):
         
         response = compute_client.launch_instance(details)
         print(f"✅ TẠO THÀNH CÔNG! Instance OCID: {response.data.id}")
-        return True
+        return "SUCCESS"
     
     except oci.exceptions.ServiceError as e:
-        if "Out of host capacity" in str(e.message) or e.status == 500:
-            print(f"⏳ [{datetime.datetime.now().strftime('%H:%M:%S')}] Out of capacity. Retry sau {RETRY_INTERVAL}s...")
+        msg = str(e.message)
+        
+        if "Out of host capacity" in msg:
+            print(f"⏳ [{datetime.datetime.now().strftime('%H:%M:%S')}] AD {ad[-5:]}: Out of capacity")
+            return "NO_CAPACITY"
+        
+        elif e.status == 429:
+            print(f"⚠️  [{datetime.datetime.now().strftime('%H:%M:%S')}] Rate limit. Chờ 60s...")
+            time.sleep(60)
+            return "RATE_LIMIT"
+        
         else:
-            print(f"❌ Lỗi: {e.status} - {e.message}")
-        return False
+            print(f"❌ Lỗi: {e.status} - {msg}")
+            return "ERROR"
+    
     except Exception as e:
         print(f"❌ Lỗi không xác định: {e}")
-        return False
+        return "ERROR"
 
 
 # ══════════════════════════════════════════════════════════════
@@ -127,17 +131,17 @@ def try_create_instance(compute_client, compartment_id, ad, image_id):
 
 def main():
     print("=" * 60)
-    print("OCI ARM Retry Script — Bắt đầu")
-    print(f"Instance name: {INSTANCE_NAME}")
+    print("OCI ARM Retry Script v2 — Multi-AD")
+    print(f"Instance: {INSTANCE_NAME}")
     print(f"Shape: {SHAPE} ({OCPUS} OCPU / {MEMORY_GB} GB RAM)")
     print("=" * 60)
     
     if not COMPARTMENT_ID:
-        print("❌ Thiếu OCI_TENANCY trong environment.")
+        print("❌ Thiếu OCI_TENANCY.")
         sys.exit(1)
     
     if not SUBNET_ID:
-        print("❌ Thiếu OCI_SUBNET_ID trong environment.")
+        print("❌ Thiếu OCI_SUBNET_ID.")
         sys.exit(1)
     
     try:
@@ -150,27 +154,35 @@ def main():
     compute_client = oci.core.ComputeClient(config)
     
     if check_instance_exists(compute_client, COMPARTMENT_ID):
-        print(f"✅ Instance '{INSTANCE_NAME}' đã tồn tại. Không cần tạo thêm.")
+        print(f"✅ Instance '{INSTANCE_NAME}' đã tồn tại. Không cần tạo.")
         sys.exit(0)
     
-    ad = get_availability_domain(identity_client, COMPARTMENT_ID)
-    print(f"📍 Availability Domain: {ad}")
+    ads = get_all_availability_domains(identity_client, COMPARTMENT_ID)
+    print(f"📍 Có {len(ads)} Availability Domains:")
+    for ad in ads:
+        print(f"   - {ad}")
     
     image_id = get_ubuntu_image(compute_client, COMPARTMENT_ID)
     print(f"🖼️  Image: {image_id}")
     print()
     
-    max_attempts = 5
-    for i in range(max_attempts):
-        print(f"🔄 Lần thử {i+1}/{max_attempts}...")
-        success = try_create_instance(compute_client, COMPARTMENT_ID, ad, image_id)
-        if success:
-            sys.exit(0)
+    for attempt in range(MAX_ATTEMPTS_PER_AD):
+        print(f"━━━ Lượt thử #{attempt+1} ━━━")
         
-        if i < max_attempts - 1:
+        for ad in ads:
+            print(f"\n🎯 Thử AD: {ad[-10:]}")
+            result = try_create_instance(compute_client, COMPARTMENT_ID, ad, image_id)
+            
+            if result == "SUCCESS":
+                sys.exit(0)
+            
+            time.sleep(5)
+        
+        if attempt < MAX_ATTEMPTS_PER_AD - 1:
+            print(f"\n⏸️  Chờ {RETRY_INTERVAL}s trước lượt tiếp...")
             time.sleep(RETRY_INTERVAL)
     
-    print("⏳ Hết lượt thử trong workflow này. GitHub Actions sẽ tự chạy lại sau 5 phút.")
+    print("\n⏳ Hết lượt. GitHub Actions sẽ tự chạy lại sau 15 phút.")
     sys.exit(0)
 
 
